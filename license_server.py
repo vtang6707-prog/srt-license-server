@@ -17,13 +17,15 @@ if not DATABASE_URL:
 
 # Fix URL nếu platform trả về postgres://
 if DATABASE_URL.startswith("postgres://"):
-    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+psycopg2://", 1)
 
 app.config["SQLALCHEMY_DATABASE_URI"] = DATABASE_URL
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 app.config["SQLALCHEMY_ENGINE_OPTIONS"] = {
     "pool_pre_ping": True,
     "pool_recycle": 280,
+    "pool_size": 5,
+    "max_overflow": 10,
 }
 
 db = SQLAlchemy(app)
@@ -35,7 +37,10 @@ class LicenseKey(db.Model):
     __tablename__ = "licenses"
 
     id = db.Column(db.Integer, primary_key=True)
-    key = db.Column(db.String(64), unique=True, nullable=False)
+
+    # Supabase table của bạn dùng cột license_key, nhưng trong code vẫn gọi là k.key
+    key = db.Column("license_key", db.String(64), unique=True, nullable=False)
+
     active = db.Column(db.Boolean, default=True)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     expires_at = db.Column(db.DateTime, nullable=False)
@@ -49,11 +54,6 @@ def require_admin():
         request.args.get("password") == ADMIN_PASSWORD
         or request.form.get("password") == ADMIN_PASSWORD
     )
-
-
-@app.before_request
-def init_db():
-    db.create_all()
 
 
 @app.route("/")
@@ -70,10 +70,17 @@ def create_key():
     if not require_admin():
         return "Unauthorized", 401
 
-    days = int(request.form.get("days", 30))
-    note = request.form.get("note", "")
-    max_devices = int(request.form.get("max_devices", 1))
+    try:
+        days = int(request.form.get("days", 30))
+    except Exception:
+        days = 30
 
+    try:
+        max_devices = int(request.form.get("max_devices", 1))
+    except Exception:
+        max_devices = 1
+
+    note = request.form.get("note", "")
     key = "SRT-" + secrets.token_urlsafe(18).replace("-", "").replace("_", "")[:20].upper()
     expires_at = datetime.utcnow() + timedelta(days=days)
 
@@ -132,7 +139,11 @@ def extend_key(key_id):
     if not require_admin():
         return "Unauthorized", 401
 
-    days = int(request.form.get("days", 30))
+    try:
+        days = int(request.form.get("days", 30))
+    except Exception:
+        days = 30
+
     item = LicenseKey.query.get_or_404(key_id)
     item.expires_at = item.expires_at + timedelta(days=days)
     db.session.commit()
@@ -166,6 +177,8 @@ def api_check():
     if now > item.expires_at:
         return jsonify({"valid": False, "reason": "KEY_EXPIRED"})
 
+    # Hiện tại max_devices=1 sẽ khóa theo 1 máy.
+    # Nếu sau này muốn nhiều máy thật sự, cần thêm bảng devices riêng.
     if item.max_devices <= 1:
         if item.device_id and item.device_id != device_id:
             return jsonify({"valid": False, "reason": "DEVICE_LOCKED"})
@@ -266,5 +279,10 @@ ADMIN_HTML = """
 """
 
 
+with app.app_context():
+    db.create_all()
+
+
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
