@@ -5,14 +5,35 @@ import secrets
 import os
 
 app = Flask(__name__)
-app.config["SQLALCHEMY_DATABASE_URI"] = "sqlite:///licenses.db"
+
+# ================== DATABASE ==================
+# Render Environment cần có:
+# SUPABASE_DB=postgresql+psycopg2://postgres.xxx:YOUR_PASSWORD@aws-xxx.pooler.supabase.com:6543/postgres
+# hoặc DATABASE_URL=...
+DATABASE_URL = os.environ.get("SUPABASE_DB") or os.environ.get("DATABASE_URL")
+
+if not DATABASE_URL:
+    raise RuntimeError("Missing SUPABASE_DB or DATABASE_URL environment variable")
+
+# Fix URL nếu platform trả về postgres://
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+
+app.config["SQLALCHEMY_DATABASE_URI"] = DATABASE_URL
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+app.config["SQLALCHEMY_ENGINE_OPTIONS"] = {
+    "pool_pre_ping": True,
+    "pool_recycle": 280,
+}
+
 db = SQLAlchemy(app)
 
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "admin123")
 
 
 class LicenseKey(db.Model):
+    __tablename__ = "licenses"
+
     id = db.Column(db.Integer, primary_key=True)
     key = db.Column(db.String(64), unique=True, nullable=False)
     active = db.Column(db.Boolean, default=True)
@@ -24,7 +45,10 @@ class LicenseKey(db.Model):
 
 
 def require_admin():
-    return request.args.get("password") == ADMIN_PASSWORD or request.form.get("password") == ADMIN_PASSWORD
+    return (
+        request.args.get("password") == ADMIN_PASSWORD
+        or request.form.get("password") == ADMIN_PASSWORD
+    )
 
 
 @app.before_request
@@ -60,6 +84,7 @@ def create_key():
         note=note,
         max_devices=max_devices,
     )
+
     db.session.add(item)
     db.session.commit()
 
@@ -74,6 +99,19 @@ def toggle_key(key_id):
     item = LicenseKey.query.get_or_404(key_id)
     item.active = not item.active
     db.session.commit()
+
+    return redirect(url_for("index", password=ADMIN_PASSWORD))
+
+
+@app.route("/reset_device/<int:key_id>")
+def reset_device(key_id):
+    if not require_admin():
+        return "Unauthorized", 401
+
+    item = LicenseKey.query.get_or_404(key_id)
+    item.device_id = None
+    db.session.commit()
+
     return redirect(url_for("index", password=ADMIN_PASSWORD))
 
 
@@ -85,6 +123,7 @@ def delete_key(key_id):
     item = LicenseKey.query.get_or_404(key_id)
     db.session.delete(item)
     db.session.commit()
+
     return redirect(url_for("index", password=ADMIN_PASSWORD))
 
 
@@ -97,14 +136,22 @@ def extend_key(key_id):
     item = LicenseKey.query.get_or_404(key_id)
     item.expires_at = item.expires_at + timedelta(days=days)
     db.session.commit()
+
     return redirect(url_for("index", password=ADMIN_PASSWORD))
 
 
 @app.route("/api/check", methods=["POST"])
 def api_check():
-    data = request.get_json(force=True)
+    data = request.get_json(force=True) or {}
+
     key = str(data.get("key", "")).strip()
     device_id = str(data.get("device_id", "")).strip()
+
+    if not key:
+        return jsonify({"valid": False, "reason": "EMPTY_KEY"})
+
+    if not device_id:
+        return jsonify({"valid": False, "reason": "EMPTY_DEVICE_ID"})
 
     item = LicenseKey.query.filter_by(key=key).first()
 
@@ -115,6 +162,7 @@ def api_check():
         return jsonify({"valid": False, "reason": "KEY_DISABLED"})
 
     now = datetime.utcnow()
+
     if now > item.expires_at:
         return jsonify({"valid": False, "reason": "KEY_EXPIRED"})
 
@@ -200,6 +248,8 @@ ADMIN_HTML = """
                 <a href="/toggle/{{ k.id }}?password={{ password }}">
                     {{ "Tắt key" if k.active else "Bật key" }}
                 </a>
+                |
+                <a href="/reset_device/{{ k.id }}?password={{ password }}" onclick="return confirm('Reset máy cho key này?')">Reset máy</a>
                 |
                 <a href="/delete/{{ k.id }}?password={{ password }}" onclick="return confirm('Xóa key?')">Xóa</a>
                 <form method="post" action="/extend/{{ k.id }}" style="display:inline;">
